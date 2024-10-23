@@ -26,7 +26,8 @@ from tqdm.auto import tqdm
 from batch_config import OpenAIBatchConfig
 import gzip
 from typing import List, Dict
-from io import StringIO
+from io import StringIO, BytesIO
+import hashlib
 
 
 
@@ -38,6 +39,7 @@ FINISHED_STATES = [ "completed", "errored_out" ]
 OPENAI_ERROR_STATES = ['failed', 'expired', 'cancelled']
 OPENAI_TERMINAL_STATES = ['completed'] + OPENAI_ERROR_STATES
 
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # ===================================================================
 # =                      CONFIG PARSING/SETUP                       =
@@ -55,7 +57,6 @@ def format_request(file_path: str, config: OpenAIBatchConfig) -> StringIO:
     # Takes a regular jsonl and makes it openai request compatible using the config
     lines = iter_jsonl(file_path)
     custom_id_base = hashlib.sha256(file_path.encode('utf-8')).hexdigest()[:16]
-
     request_list = []
     for line_num, line in enumerate(lines):
         custom_id = '%s_%06d' % (custom_id_base, line_num)
@@ -73,15 +74,14 @@ def format_request(file_path: str, config: OpenAIBatchConfig) -> StringIO:
                   'messages': messages,     
                   'max_tokens': config.max_tokens,
                   'temperature': 0.1,
-                  'log_probs': True,
+                  'logprobs': True,
                   'top_logprobs': 5,
                   'response_format': config.response_format
                 }
               }
         request_list.append(json.dumps(req))
-
     output_str = '\n'.join(request_list)
-    output = StringIO(output_str)
+    output = BytesIO(output_str.encode('utf-8'))
     output.seek(0)
     return output
 
@@ -119,31 +119,53 @@ def upload_and_start_batch(file_path: str, config: OpenAIBatchConfig, experiment
 def download_batch_result(batch_id, config): # -> (batch_id: str, status: str)
     # Retrieve the batch result from OpenAI API
     output_dir = config.output_dir
-    os.makedir(output_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
 
     batch_data = client.batches.retrieve(batch_id)
     status = batch_data.status
 
     if status != "completed":
-        print(f"WARNING: {batch_id} is not completed, status: {batch_data.status}")
         return batch_id, status
     
     if batch_data.output_file_id is None:
-        print(f"WARNING: {batch_id} is completed, but not output file was generated")
         return batch_id, status
-
-    print(f"Downloading batch data for {batch_id}")
 
     file_response = client.files.content(batch_data.output_file_id)
 
     # Define output file path
-    output_file = os.path.join(output_dir, f"{batch_id}.json")
+    output_file = os.path.join(output_dir, f"{batch_id}.jsonl")
 
     # Save the result to a file
     with open(output_file, 'w') as f:
         f.write(str(file_response.text))
 
     return batch_id, status
+
+
+def get_total_space_usage():
+    return sum(file.bytes for file in client.files.list())    
+
+
+def make_response_schema(triples):
+    """ Takes in a list of triples of form (property_name, type, description)
+        and makes the response schema
+    """
+
+    properties_dict = {trip[0]: {'type': trip[1], 'description': trip[2]} for trip in triples}
+    return {
+      'type': 'json_schema',
+      'json_schema': {
+        'name': 'response_schema',
+        'schema': {
+          'type': 'object',
+          'properties': properties_dict,
+          'additionalProperties': False,
+          'required': [_[0] for _ in triples]
+        },
+      'strict': True
+      }
+    }
+
 
 
 # =================================================
@@ -158,7 +180,7 @@ def load_status_file(status_file: str) -> Dict:
     return json.loads(open(status_file, 'r').read())
 
 def init_status_file(status_file: str, files: str) -> Dict:
-    os.makedir(os.path.dirname(status_file), exist_ok=True)
+    os.makedirs(os.path.dirname(status_file), exist_ok=True)
 
     status_dict = {'last_updated': get_time(),
                    'total_files': len(files),
@@ -188,6 +210,8 @@ def update_status_file(status_file: str, status_dict: Dict):
 
 def main_sandbox(config: str, status_file: str, max_gb: int, wait: bool, interval: int, experiment_description=None):
     main_upload(config, status_file, max_gb, experiment_description=experiment_description)
+    main_check(config, status_file, wait, interval)
+    main_merge(config, status_file)
 
 
 def main_upload(config: str, status_file: str, max_gb: int, experiment_description=None):
@@ -201,7 +225,7 @@ def main_upload(config: str, status_file: str, max_gb: int, experiment_descripti
     config = OpenAIBatchConfig.from_json(config)
     all_files = config.expand_files()
     assert len(set(all_files)) == len(all_files), "Need unique full filenames"
-    status_dict = init_status_file(status_dict, all_files)
+    status_dict = init_status_file(status_file, all_files)
 
 
     # Upload all files:
@@ -214,15 +238,15 @@ def main_upload(config: str, status_file: str, max_gb: int, experiment_descripti
 
 
 
-def check(config: str, status_file: str, wait: bool, interval: int):
+def main_check(config: str, status_file: str, wait: bool, interval: int):
     config = OpenAIBatchConfig.from_json(config)
     status_dict = load_status_file(status_file)
     while True:
-        for filename, file_status in tqdm(status_dict['files'].items()):
+        for filename, file_status in status_dict['files'].items():
             if file_status['status'] in FINISHED_STATES:
                 continue
             batch_id = file_status['batch_id']
-            _, status = download_batch_result
+            _, status = download_batch_result(batch_id, config)
             if status in OPENAI_ERROR_STATES:
                 file_status['status'] == 'errored_out'
                 status_dict['processing_files'] -= 1
@@ -247,11 +271,43 @@ def check(config: str, status_file: str, wait: bool, interval: int):
         time.sleep(interval)
 
 
+def main_merge(config: str, status_file: str):
+    config = OpenAIBatchConfig.from_json(config)
+    status_dict = load_status_file(status_file)
+    os.makedirs(config.merge_dir, exist_ok=True)
+    assert len(status_dict['files'].keys()) == len(set(status_dict['files'].keys())), "Unique basenames needed for merge!"    
+    for filename, file_status in tqdm(status_dict['files'].items()):
+        if file_status.get('status') != 'completed':
+            continue
+        og_data = iter_jsonl(filename)
+        response_file = os.path.join(config.output_dir, '%s.jsonl' % file_status['batch_id'])
+        response_content = [json.loads(_) for _ in open(response_file, 'rb').read().splitlines()]
+        assert len(og_data) == len(response_content), "Weirdly mismatched input<->response items"
+        output_data = []
+        for og_datum, response in zip(og_data, response_content):
+            og_datum['openai_response'] = json.loads(response['response']['body']['choices'][0]['message']['content'])
+            output_data.append(og_datum)
+        print("OUTPUT DATA LEN", len(output_data))
+        merge_content = b'\n'.join([json.dumps(_).encode('utf-8') for _ in output_data])
+        merge_file = os.path.join(config.merge_dir, os.path.basename(filename))
+        with open(merge_file, 'wb') as f:
+            f.write(merge_content)
+
+
+
+def main_clean():
+    all_files = list(client.files.list())
+    if input(f"Are you sure you want to delete {len(all_files)} files from your OpenAI account? [y/N]").lower() == "y":
+        for file in tqdm(all_files):
+            client.files.delete(file.id)
+
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Upload .jsonl files and process batches in OpenAI API.")
 
     # General args
-    parser.add_argument('--command', type=str, choices=['sandbox', 'upload', 'check', 'clean'], required=True)
+    parser.add_argument('--command', type=str, choices=['sandbox', 'upload', 'check', 'clean', 'merge'], required=True)
     parser.add_argument('--config', type=str, required=True)
     parser.add_argument('--status-file', type=str, required=True, help="Some stuff to help with")
     parser.add_argument('--experiment', type=str)
@@ -260,7 +316,7 @@ if __name__ == '__main__':
     parser.add_argument('--max-gb', type=int, default=25, help="Max number of GB of batch processing files to upload at one time")
 
     # Sandbox/Check specific args
-    parser.add_argument('--wait', type=bool, help="If present/true will wait and check periodically until done")
+    parser.add_argument('--wait', action="store_true", default=False, help="If present/true will wait and check periodically until done")
     parser.add_argument('--interval', type=int, default=10, help="If waiting, will wait this many secs between checks")
 
     # Main calls
@@ -270,7 +326,9 @@ if __name__ == '__main__':
     elif args.command == 'upload':
         main_upload(config=args.config, status_file=args.status_file, max_gb=args.max_gb, experiment_description=args.experiment)
     elif args.command == 'check':
-        main_check(config=args.config, status_file=args.status_file)
+        main_check(config=args.config, status_file=args.status_file, wait=args.wait, interval=args.interval)
+    elif args.command == 'merge':
+        main_merge(config=args.config, status_file=args.status_file)
     elif args.command == 'clean':
         main_clean()
     else:
