@@ -12,7 +12,7 @@ Extra features:
     - Some internal files to monitor/check some values of experiments 
 
 3. Sandbox mode:
-    - sandbox command to run a single file to make sure things work well
+    - sandbox command to run everything for a directory to make sure things work well
 
 """
 
@@ -287,9 +287,11 @@ def main_merge(config: str, status_file: str):
         for og_datum, response in zip(og_data, response_content):
             og_datum['openai_response'] = json.loads(response['response']['body']['choices'][0]['message']['content'])
             output_data.append(og_datum)
-        print("OUTPUT DATA LEN", len(output_data))
         merge_content = b'\n'.join([json.dumps(_).encode('utf-8') for _ in output_data])
         merge_file = os.path.join(config.merge_dir, os.path.basename(filename))
+        if merge_file.endswith('.gz'):
+            merge_content = gzip.compress(merge_content)
+        
         with open(merge_file, 'wb') as f:
             f.write(merge_content)
 
