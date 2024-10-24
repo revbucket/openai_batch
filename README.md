@@ -41,3 +41,9 @@ and finally
 --config experiments/example/config.json \
 --status-file experiments/example/status.json
 ```
+
+# Some TODOs/Improvements
+Here are some features that might be nice to have in the future:
+- S3 support
+- More sophisticated tracking than a json (maybe really important if lots of files)
+- Estimated cost before submitting jobs (or after running things)
